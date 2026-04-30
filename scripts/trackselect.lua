@@ -13,16 +13,18 @@ local defaults = {
     audio = {
         selected = nil,
         best = {},
+        expected_score = nil,
         lang_score = nil,
         channels_score = -math.huge,
         preferred = "jpn/japanese",
-        excluded = "",
+        excluded = "commentary/cast/staff/dub/guide",
         expected = "",
         id = ""
     },
     video = {
         selected = nil,
         best = {},
+        expected_score = nil,
         lang_score = nil,
         preferred = "",
         excluded = "",
@@ -32,6 +34,7 @@ local defaults = {
     sub = {
         selected = nil,
         best = {},
+        expected_score = nil,
         lang_score = nil,
         preferred = "eng",
         excluded = "sign",
@@ -54,11 +57,6 @@ local options = {
 
     -- Try to re-select the last track if mpv cannot do it e.g. when fingerprint changes
     smart_keep = false,
-
-    --add above (after a comma) any protocol to disable
-    special_protocols = [[
-	["://", "^magnet:"]
-	]],
 }
 
 for _type, track in pairs(defaults) do
@@ -72,41 +70,32 @@ options["preferred_audio_channels"] = ""
 local tracks = {}
 local last = {}
 local fingerprint = ""
+local trackselect_ran = false
 
 opt.read_options(options, _, function() end)
 
-options.special_protocols = utils.parse_json(options.special_protocols)
-
-local function need_ignore(tab, val)
-    for index, element in ipairs(tab) do
-        if string.find(val, element) then
-            return true
-        end
-    end
-    return false
-end
-
-function contains(track, words, attr)
+local function contains(track, words, attr)
     if not track[attr] then return false end
     local i = 0
     if track.external then
         i = 1
     end
     for word in string.gmatch(words:lower(), "([^/]+)") do
+        local w = word:match("^%s*(.-)%s*$")
         i = i - 1
-        if string.find(tostring(track[attr] or ""):lower(), word) then
+        if w ~= "" and string.find(tostring(track[attr] or ""):lower(), w) then
             return i
         end
     end
     return false
 end
 
-function preferred(track, words, attr, title)
+local function preferred(track, words, attr, title)
     local score = contains(track, words, attr)
     if not score then
         if tracks[track.type][title] == nil then
             tracks[track.type][title] = -math.huge
-            return true
+            return false
         end
         return false
     end
@@ -117,7 +106,7 @@ function preferred(track, words, attr, title)
     return false
 end
 
-function preferred_or_equals(track, words, attr, title)
+local function preferred_or_equals(track, words, attr, title)
     local score = contains(track, words, attr)
     if not score then
         if tracks[track.type][title] == nil or tracks[track.type][title] == -math.huge then
@@ -131,14 +120,14 @@ function preferred_or_equals(track, words, attr, title)
     return false
 end
 
-function copy(obj)
+local function copy(obj)
     if type(obj) ~= "table" then return obj end
     local res = {}
     for k, v in pairs(obj) do res[k] = copy(v) end
     return res
 end
 
-function track_layout_hash(tracklist)
+local function track_layout_hash(tracklist)
     local t = {}
     for _, track in ipairs(tracklist) do
         t[#t + 1] = string.format("%s-%d-%s-%s-%s-%s", track.type, track.id, tostring(track.default),
@@ -147,10 +136,33 @@ function track_layout_hash(tracklist)
     return table.concat(t, "\n")
 end
 
-function trackselect()
-    local fpath = mp.get_property('path')
-    if not options.enabled then return end
-    if need_ignore(options.special_protocols, fpath) then return end
+local function selected_tracks()
+    if not trackselect_ran then
+        return
+    end
+    last = {}
+    local tracklist = mp.get_property_native("track-list")
+    for _, track in ipairs(tracklist) do
+        if track.selected then
+            last[track.type] = track
+        end
+    end
+end
+
+local function trackselect()
+    if options.smart_keep then
+        -- observe specific current-tracks sub-properties
+        local props = { 'current-tracks/video', 'current-tracks/audio', 'current-tracks/sub' }
+        for _, p in ipairs(props) do
+            mp.observe_property(p, 'native', selected_tracks)
+        end
+    end
+
+    trackselect_ran = true
+    if not options.enabled then
+        return
+    end
+
     tracks = copy(defaults)
     local filename = mp.get_property("filename/no-ext")
     local tracklist = mp.get_property_native("track-list")
@@ -164,10 +176,11 @@ function trackselect()
         fingerprint = new_fingerprint
         tracklist_changed = true
     end
+
     for _, track in ipairs(tracklist) do
         if options.smart_keep and last[track.type] ~= nil and last[track.type].lang == track.lang and
-            last[track.type].codec == track.codec and last[track.type].external == track.external and
-            last[track.type].title == track.title then
+            track.codec ~= "null" and last[track.type].codec == track.codec and
+            last[track.type].external == track.external and last[track.type].title == track.title then
             tracks[track.type].best = track
             options["preferred_" .. track.type .. "_lang"] = ""
             options["excluded_" .. track.type .. "_words"] = ""
@@ -185,8 +198,9 @@ function trackselect()
                 options["preferred_" .. track.type .. "_channels"] = ""
             end
         end
-        if options["preferred_" .. track.type .. "_lang"] ~= "" or options["excluded_" .. track.type .. "_words"] ~= ""
-            or options["expected_" .. track.type .. "_words"] ~= "" or
+        if track.codec ~= "null" and options["preferred_" .. track.type .. "_lang"] ~= "" or
+            options["excluded_" .. track.type .. "_words"] ~= "" or
+            options["expected_" .. track.type .. "_words"] ~= "" or
             (options["preferred_" .. track.type .. "_channels"] or "") ~= "" then
             if track.selected then
                 tracks[track.type].selected = track.id
@@ -195,14 +209,23 @@ function trackselect()
                 end
             end
             if track.title then
-                track.title = string.gsub(string.gsub(track.title, "[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%1"), filename, "")
+                local safe_filename = tostring(filename or ""):gsub("[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%1")
+                track.title = string.gsub(track.title, safe_filename, "")
             end
-            if next(tracks[track.type].best) == nil or not (tracks[track.type].best.external
-            and tracks[track.type].best.lang ~= nil and not track.external) then
+            if (next(tracks[track.type].best) == nil or not (tracks[track.type].best.external
+                and tracks[track.type].best.lang ~= nil and not track.external)) then
                 if options["excluded_" .. track.type .. "_words"] == "" or
                     not contains(track, options["excluded_" .. track.type .. "_words"], "title") then
-                    if options["expected_" .. track.type .. "_words"] == "" or
-                        contains(track, options["expected_" .. track.type .. "_words"], "title") then
+                    local exp_words = options["expected_" .. track.type .. "_words"] or ""
+                    local exp_score = nil
+                    if exp_words ~= "" then
+                        exp_score = contains(track, exp_words, "title")
+                    end
+                    if exp_score and (tracks[track.type].expected_score == nil or
+                        exp_score > tracks[track.type].expected_score) then
+                        tracks[track.type].expected_score = exp_score
+                        tracks[track.type].best = track
+                    elseif tracks[track.type].expected_score == nil then
                         local pass = true
                         local channels = false
                         local lang = false
@@ -216,9 +239,9 @@ function trackselect()
                         if options["preferred_" .. track.type .. "_lang"] ~= "" then
                             lang = preferred(track, options["preferred_" .. track.type .. "_lang"], "lang", "lang_score")
                         end
+
                         if (options["preferred_" .. track.type .. "_lang"] == "" and pass) or channels or lang or
-                            (track.external and track.lang == nil and
-                            (not tracks[track.type].best.external or tracks[track.type].best.lang == nil)) then
+                            (track.external and track.lang == nil and next(tracks[track.type].best) == nil) then
                             tracks[track.type].best = track
                         end
                     end
@@ -226,22 +249,13 @@ function trackselect()
             end
         end
     end
+
     for _type, track in pairs(tracks) do
         if next(track.best) ~= nil and track.best.id ~= track.selected then
-            mp.set_property(_type:sub(1, 1) .. "id", track.best.id)
+            mp.set_property('file-local-options/'.. _type:sub(1, 1) .. "id", track.best.id)
             if options.smart_keep and found_last[track.best.type] then
                 last[track.best.type] = track.best
             end
-        end
-    end
-end
-
-function selected_tracks()
-    local tracklist = mp.get_property_native("track-list")
-    last = {}
-    for _, track in ipairs(tracklist) do
-        if track.selected then
-            last[track.type] = track
         end
     end
 end
@@ -252,6 +266,7 @@ else
     mp.register_event("file-loaded", trackselect)
 end
 
-if options.smart_keep then
-    mp.register_event("track-switched", selected_tracks)
-end
+mp.add_hook("on_unload", 50, function()
+    trackselect_ran = false
+    mp.unobserve_property(selected_tracks)
+end)
